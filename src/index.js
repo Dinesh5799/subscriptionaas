@@ -6,10 +6,13 @@ const { port } = require("../config");
 const {
   getISTTime,
   userNameFormatter,
+  calculateExpiryDate,
+  formatPlanExpiryDate,
+  getISTTimeWithoutHMS,
   isNULLEMPTYORUNDEFINED,
 } = require("./Utility");
-
-const { paymentsPost } = require("./WebApiManager");
+const { paymentsEndpoint } = require("../config");
+const Axios = require("axios");
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -109,14 +112,17 @@ app.post("/subscription", async (req, res) => {
       isNULLEMPTYORUNDEFINED(start_date)
     )
       return res.status(400).send({ errorMessage: "Bad request" });
-    let client = await pool.connect();
     user_name = userNameFormatter(user_name);
-
+    let client = await pool.connect();
+    let userAlreadyExistsRes = await userAlreadyExists(user_name, client);
+    if (!userAlreadyExistsRes) {
+      return res.status(404).send({ errorMessage: "User not found!" });
+    }
+    user_name = userNameFormatter(user_name);
     let getPlanDetails = await client.query(
       `SELECT * FROM PLAN_DETAILS WHERE PLAN_ID = $1`,
       [`${plan_id}`]
     );
-
     if (getPlanDetails.rowCount === 0)
       return res.status(400).send({ errorMessage: "Invalid Plan Details" });
     getPlanDetails = getPlanDetails.rows[0];
@@ -137,6 +143,7 @@ app.post("/subscription", async (req, res) => {
     } else {
       getUserExistingSubscriptionDetails =
         getUserExistingSubscriptionDetails.rows[0];
+
       let existingPlanStartDate = getUserExistingSubscriptionDetails.start_date;
       start_date = getISTTimeWithoutHMS(start_date);
       existingPlanStartDate = getISTTimeWithoutHMS(existingPlanStartDate);
@@ -159,6 +166,7 @@ app.post("/subscription", async (req, res) => {
           validityForGivenPlan
         );
         newPlanExpiryDate = getISTTimeWithoutHMS(newPlanExpiryDate);
+
         if (
           (existingPlanStartDate >= start_date &&
             existingPlanStartDate <= newPlanExpiryDate) ||
@@ -170,52 +178,76 @@ app.post("/subscription", async (req, res) => {
       }
     }
     let finalCost = 0;
-    if (isSubscriptionOverlapping) {
+    if (!isSubscriptionOverlapping) {
       finalCost = costInUSDForGivenPlan;
     } else {
-      finalCost = existingPlanCost - costInUSDForGivenPlan;
+      finalCost = costInUSDForGivenPlan - existingPlanCost;
     }
 
     let data = {};
     data.user_name = user_name;
     data.payment_type = finalCost >= 0 ? "DEBIT" : "CREDIT";
-    data.amount = finalCost;
-    paymentsPost()
-      .then(async (Response) => {
-        let status =
-          (Response && Response.data && Response.data.status) || "FAILURE";
-        let payment_id =
-          (Response && Response.data && Response.data.payment_id) || "";
-        await updatePaymentStatus(
-          client,
-          user_name,
-          status,
-          payment_id,
-          finalCost
-        );
-        if (status === "SUCCESS") {
-          let getCurrentTime = getISTTime();
-          await client.query(
-            `INSERT INTO USER_SUBSCRIPTIONS(USER_NAME, PLAN_ID, PAYMENT_ID, START_DATE, SUBSCRIBED_ON)`,
-            [
-              `${user_name}`,
-              `${plan_id}`,
-              `${payment_id}`,
-              `${start_date}`,
-              `${getCurrentTime}`,
-            ]
+    data.amount = parseFloat(finalCost);
+    if (finalCost !== 0) {
+      Axios.post(paymentsEndpoint, data)
+        .then(async (Response) => {
+          let status =
+            (Response && Response.data && Response.data.status) || "FAILURE";
+          let payment_id =
+            (Response && Response.data && Response.data.payment_id) || "";
+          await updatePaymentStatus(
+            client,
+            user_name,
+            status,
+            payment_id,
+            finalCost
           );
-        }
-        client.release();
-        return res.status(200).send({ status, amount: finalCost });
-      })
-      .catch(async (err) => {
-        await updatePaymentStatus(client, user_name, "FAILURE", "", finalCost);
-        client.release();
-        return res
-          .status(500)
-          .send({ errorMessage: "Internal Server Error. " + e.message });
-      });
+          if (status === "SUCCESS") {
+            let getCurrentTime = getISTTime();
+            await client.query(
+              `INSERT INTO USER_SUBSCRIPTIONS(USER_NAME, PLAN_ID, PAYMENT_ID, START_DATE, SUBSCRIBED_ON) 
+            VALUES($1, $2, $3, $4, $5)`,
+              [
+                `${user_name}`,
+                `${plan_id}`,
+                `${payment_id}`,
+                `${start_date}`,
+                `${getCurrentTime}`,
+              ]
+            );
+          }
+          client.release();
+          return res.status(200).send({ status, amount: finalCost });
+        })
+        .catch(async (err) => {
+          await updatePaymentStatus(
+            client,
+            user_name,
+            "FAILURE",
+            "",
+            finalCost
+          );
+          client.release();
+          return res
+            .status(500)
+            .send({ errorMessage: "Internal Server Error. " + err });
+        });
+    } else {
+      let getCurrentTime = getISTTime();
+      await client.query(
+        `INSERT INTO USER_SUBSCRIPTIONS(USER_NAME, PLAN_ID, PAYMENT_ID, START_DATE, SUBSCRIBED_ON) 
+      VALUES($1, $2, $3, $4, $5)`,
+        [
+          `${user_name}`,
+          `${plan_id}`,
+          `FREE_OR_TRAIL_OR_SAME_PLAN`,
+          `${start_date}`,
+          `${getCurrentTime}`,
+        ]
+      );
+      client.release();
+      return res.status(200).send({ status: "SUCCESS", amount: finalCost });
+    }
   } catch (e) {
     return res
       .status(500)
@@ -228,14 +260,18 @@ app.get("/subscription/:username", async (req, res) => {
     let user_name = req.params["username"];
     if (isNULLEMPTYORUNDEFINED(user_name))
       return res.status(400).send({ errorMessage: "Bad request" });
+    user_name = userNameFormatter(user_name);
     let client = await pool.connect();
     let userAlreadyExistsRes = await userAlreadyExists(user_name, client);
     if (!userAlreadyExistsRes) {
       return res.status(404).send({ errorMessage: "User not found!" });
     }
-    let getUserSubscriptionsQueryRes = await client.query(`SELECT US.USER_NAME, US.PLAN_ID, US.START_DATE, US.SUBSCRIBED_ON, 
-    PD.VALIDITY, PD.COST_IN_USD FROM USER_SUBSCRIPTIONS US JOIN PLAN_DETAILS PD ON US.PLAN_ID = PD.PLAN_ID WHERE US.USER_NAME = $1 
-    ORDER BY US.SUBSCRIBED_ON DESC NULLS LAST`);
+    let getUserSubscriptionsQueryRes = await client.query(
+      `SELECT US.USER_NAME, US.PLAN_ID, US.START_DATE, 
+    PD.VALIDITY FROM USER_SUBSCRIPTIONS US JOIN PLAN_DETAILS PD ON US.PLAN_ID = PD.PLAN_ID WHERE US.USER_NAME = $1 
+    ORDER BY US.SUBSCRIBED_ON DESC NULLS LAST`,
+      [`${user_name}`]
+    );
     client.release();
     if (getUserSubscriptionsQueryRes.rowCount === 0)
       return res.status(200).send([]);
@@ -243,8 +279,10 @@ app.get("/subscription/:username", async (req, res) => {
       getUserSubscriptionsQueryRes = getUserSubscriptionsQueryRes.rows;
       let finalFormattedres = [];
       for (let i = 0; i < getUserSubscriptionsQueryRes.length; i++) {
-        let { plan_id, start_date, validity } = getUserSubscriptionsQueryRes;
-        let tempObj = { plan_id, start_date };
+        let { plan_id, start_date, validity } = getUserSubscriptionsQueryRes[i];
+        let tempObj = {};
+        tempObj.plan_id = plan_id;
+        tempObj.start_date = getISTTimeWithoutHMS(start_date);
         tempObj.valid_till = formatPlanExpiryDate(start_date, validity);
         finalFormattedres.push(tempObj);
       }
@@ -263,6 +301,7 @@ app.get("/subscription/:username/:specifieddate", async (req, res) => {
     let specifieddate = req.params["specifieddate"];
     if (isNULLEMPTYORUNDEFINED(user_name))
       return res.status(400).send({ errorMessage: "Bad request" });
+    user_name = userNameFormatter(user_name);
     let client = await pool.connect();
     let userAlreadyExistsRes = await userAlreadyExists(user_name, client);
     if (!userAlreadyExistsRes) {
@@ -274,11 +313,9 @@ app.get("/subscription/:username/:specifieddate", async (req, res) => {
       [`${user_name}`]
     );
     client.release();
-    getsubscriptionDetailsRes =
-      (getsubscriptionDetailsRes.rows && getsubscriptionDetailsRes.rows[0]) ||
-      [];
+    getsubscriptionDetailsRes = getsubscriptionDetailsRes.rows || [];
     if (getsubscriptionDetailsRes.length > 0) {
-      let { plan_id, validity, start_date } = getsubscriptionDetailsRes;
+      let { plan_id, validity, start_date } = getsubscriptionDetailsRes[0];
       if (validity !== -1) {
         let expiryDate = getISTTimeWithoutHMS(start_date);
         expiryDate = formatPlanExpiryDate(expiryDate, validity);

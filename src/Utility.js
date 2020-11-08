@@ -4,12 +4,12 @@ function isNULLEMPTYORUNDEFINED(value) {
 }
 
 function getISTTime(givenDate) {
-  if (givenDate === undefined) return formatDateToIST(new Date());
+  if (givenDate === undefined) return formatDateToIST(new Date(), true);
   return formatDateToIST(givenDate, true);
 }
 
 function getISTTimeWithoutHMS(givenDate) {
-  if (givenDate === undefined) return formatDateToIST(new Date());
+  if (givenDate === undefined) return formatDateToIST(new Date(), false);
   return formatDateToIST(givenDate, false);
 }
 
@@ -52,5 +52,8 @@ function userNameFormatter(user_name) {
 module.exports = {
   getISTTime,
   userNameFormatter,
+  calculateExpiryDate,
+  formatPlanExpiryDate,
+  getISTTimeWithoutHMS,
   isNULLEMPTYORUNDEFINED,
 };
